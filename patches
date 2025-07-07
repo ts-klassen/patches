@@ -37,7 +37,21 @@ if [[ ${1-} == "--make" || ${1-} == "-m" ]]; then
   shift
 fi
 
+# Resolve working directory path argument (may be relative)
 workdir="${1:-$PWD}"
+
+# Utility helper for fatal errors (must appear before first use)
+die() {
+  echo "patches: $*" >&2
+  exit 2
+}
+
+# Validate that the provided WORKDIR actually exists and is a directory before
+# we attempt to cd into it for path canonicalisation.  This provides a clearer
+# error message than the default shell "cd: ... No such file or directory".
+[[ -d $workdir ]] || die "'$workdir' is not a directory – nothing to do"
+
+# Canonicalise to an absolute path now that we know it exists.
 workdir=$(cd "$workdir" && pwd)
 
 ###############################################################################
@@ -49,7 +63,7 @@ dist="$workdir/dist"
 patch_dir="$workdir/patches"
 rej_dir="$workdir/rej"
 
-die() { echo "patches: $*" >&2; exit 2; }
+# (die is defined earlier)
 
 [[ -d $orig ]] || die "'$orig' does not exist – nothing to do"
 
