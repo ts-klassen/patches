@@ -1,0 +1,248 @@
+#!/usr/bin/env bash
+
+# "patches": apply or generate per-file patch diffs for a working directory
+#
+# Usage:
+#   patches [--make|-m] [WORKDIR]
+#
+#   Without --make (default)  →  apply all patch files found in WORKDIR/patches
+#   With    --make            →  generate/refresh patch files under that folder
+#
+#   WORKDIR defaults to the current directory if omitted.  WORKDIR must contain
+#   an "orig" directory.  The tool may create or update the following peers:
+#      dist/    – copy of orig/ with patches applied (apply mode)
+#      patches/ – *.patch files (one per changed source file)   (make mode)
+#      rej/     – .rej files created by patch when hunks fail   (apply mode)
+#
+# Exit status:
+#   0  success
+#   1  at least one patch could not be applied cleanly (apply mode)
+#   2  usage / environment error
+#
+# Key behaviour:
+#   • One .patch per file, so users can keep comment headers.  Those headers
+#     (anything before the first diff header) are preserved on regeneration.
+#   • Applying never leaves *.orig backups behind (uses --no-backup-if-mismatch).
+#     Pre-existing *.orig files in orig/ are copied unchanged.
+
+set -euo pipefail
+
+###############################################################################
+# CLI parsing
+###############################################################################
+
+mode="apply"
+if [[ ${1-} == "--make" || ${1-} == "-m" ]]; then
+  mode="make"
+  shift
+fi
+
+# Resolve working directory path argument (may be relative)
+workdir="${1:-$PWD}"
+
+# Utility helper for fatal errors (must appear before first use)
+die() {
+  echo "patches: $*" >&2
+  exit 2
+}
+
+# Validate that the provided WORKDIR actually exists and is a directory before
+# we attempt to cd into it for path canonicalisation.  This provides a clearer
+# error message than the default shell "cd: ... No such file or directory".
+[[ -d $workdir ]] || die "'$workdir' is not a directory – nothing to do"
+
+# Canonicalise to an absolute path now that we know it exists.
+workdir=$(cd "$workdir" && pwd)
+
+###############################################################################
+# Path constants
+###############################################################################
+
+orig="$workdir/orig"
+dist="$workdir/dist"
+patch_dir="$workdir/patches"
+rej_dir="$workdir/rej"
+
+# (die is defined earlier)
+
+[[ -d $orig ]] || die "'$orig' does not exist – nothing to do"
+
+# Regex to detect beginning of diff header lines.
+header_re='^(diff |--- |\*\*\* |Index: )'
+
+###############################################################################
+# MAKE MODE – refresh per-file patches
+###############################################################################
+
+if [[ $mode == "make" ]]; then
+  mkdir -p "$patch_dir"
+
+  # Collect union of regular files across orig/ and (if present) dist/.
+  mapfile -t files < <(
+    {
+      (cd "$orig" && find . -type f -print0 2>/dev/null || true)
+      if [[ -d $dist ]]; then
+        (cd "$dist" && find . -type f -print0 2>/dev/null || true)
+      fi
+    } | tr '\0' '\n' | sort -u
+  )
+
+  declare -A kept=()
+
+  for rel in "${files[@]}"; do
+    rel="${rel#./}"
+    op="$orig/$rel"
+    dp="$dist/$rel"
+    pp="$patch_dir/$rel.patch"
+
+    state="same"
+    if [[ -e $op && -e $dp ]]; then
+      cmp -s "$op" "$dp" || state="modified"
+    elif [[ -e $op && ! -e $dp ]]; then
+      state="deleted"
+    elif [[ ! -e $op && -e $dp ]]; then
+      state="added"
+    fi
+
+    if [[ $state == "same" ]]; then
+      [[ -f $pp ]] && rm -f "$pp"
+      continue
+    fi
+
+    mkdir -p "$(dirname "$pp")"
+
+    # Create a per-iteration temporary file for diff output. Set up a trap so
+    # that if the script is interrupted (e.g. via SIGINT) the temporary file
+    # is deleted instead of being left behind.
+    tmp=$(mktemp "$patch_dir/.tmpXXXXXX")
+
+    cleanup_tmp() {
+      [[ -n ${tmp-} && -f $tmp ]] && rm -f "$tmp"
+    }
+
+    # Remove the temporary file on normal shell EXIT, and also if the user
+    # aborts with Ctrl-C (SIGINT) or the process receives SIGTERM.
+    trap 'cleanup_tmp; exit 1' INT TERM
+    trap 'cleanup_tmp' EXIT
+
+    # Run diff from within $workdir so generated paths are relative (e.g.
+    # orig/foo.txt) instead of absolute.  This ensures patch -p1 works.
+    pushd "$workdir" >/dev/null
+    case $state in
+      modified)
+        # Temporarily disable `set -e` so that the non-zero exit status (1)
+        # that diff returns when differences are found does not abort the
+        # script. We capture the exit code in $status and re-enable the
+        # option immediately afterwards.
+        set +e
+        diff -uN "orig/$rel" "dist/$rel" > "$tmp"
+        status=$?
+        set -e ;;
+      added)
+        set +e
+        diff -uN /dev/null "dist/$rel" > "$tmp"
+        status=$?
+        set -e ;;
+      deleted)
+        set +e
+        diff -uN "orig/$rel" /dev/null > "$tmp"
+        status=$?
+        set -e ;;
+    esac
+    popd >/dev/null
+
+    # Accept exit status 0 (no diff) or 1 (diffs found).  Anything else is
+    # a real error (e.g. I/O problem) and should abort.
+    if (( status > 1 )); then
+      echo "patches: diff failed for $rel (status $status)" >&2
+      exit $status
+    fi
+
+    # Preserve leading comment block if present.
+    header=""
+    if [[ -f $pp ]]; then
+      while IFS= read -r line || [[ -n $line ]]; do
+        [[ $line =~ $header_re ]] && break
+        header+="$line"$'\n'
+      done < "$pp"
+    fi
+
+    {
+      [[ -n $header ]] && printf '%s' "$header"
+      cat "$tmp"
+    } > "$pp"
+
+    rm "$tmp"
+    # Clear the cleanup trap now that the temporary file is gone to avoid
+    # redundant checks later and so that subsequent iterations can install
+    # their own handler.
+    trap - INT TERM EXIT
+    kept["$pp"]=1
+  done
+
+  # Remove stale patch files not touched this run.
+  while IFS= read -r -d '' p_existing; do
+    [[ -n ${kept["$p_existing"]+x} ]] || rm -f "$p_existing"
+  done < <(find "$patch_dir" -type f -name '*.patch' -print0)
+
+  # Prune empty directories.
+  find "$patch_dir" -type d -empty -delete
+
+  echo "patches: patches refreshed under $patch_dir/" >&2
+  exit 0
+fi
+
+###############################################################################
+# APPLY MODE – build dist/ then apply patches
+###############################################################################
+
+# Re-create dist as clean copy of orig.
+rm -rf "$dist"
+mkdir -p "$dist"
+cp -a "$orig/." "$dist/"
+
+# Quick exit if there are no patch files.
+if [[ ! -d $patch_dir ]]; then
+  echo "patches: no patches directory – dist equals orig." >&2
+  exit 0
+fi
+
+mapfile -t pfiles < <(find "$patch_dir" -type f -name '*.patch' | sort)
+if [[ ${#pfiles[@]} -eq 0 ]]; then
+  echo "patches: no patch files – dist equals orig." >&2
+  exit 0
+fi
+
+mkdir -p "$rej_dir"
+pushd "$dist" >/dev/null
+
+fail=0
+
+for pf in "${pfiles[@]}"; do
+  base="$(basename "$pf")"
+  rel="${pf#$patch_dir/}"
+  rpath="$rej_dir/${rel%.patch}.rej"
+  mkdir -p "$(dirname "$rpath")"
+
+  echo "patches: applying $base" >&2
+
+  if ! patch --batch --no-backup-if-mismatch -p1 -r "$rpath" < "$pf"; then
+    fail=1
+  fi
+
+  if [[ -s $rpath ]]; then
+    fail=1
+  else
+    rm -f "$rpath"
+  fi
+done
+
+popd >/dev/null
+
+if (( fail )); then
+  echo "patches: one or more patches failed – see $rej_dir" >&2
+  exit 1
+fi
+
+echo "patches: all patches applied successfully → $dist" >&2
+exit 0
