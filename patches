@@ -102,11 +102,21 @@ if [[ $mode == "make" ]]; then
     # orig/foo.txt) instead of absolute.  This ensures patch -p1 works.
     pushd "$workdir" >/dev/null
     case $state in
-      modified) diff -uN "orig/$rel" "dist/$rel" > "$tmp" || true ;;
-      added)    diff -uN /dev/null "dist/$rel" > "$tmp" || true ;;
-      deleted)  diff -uN "orig/$rel" /dev/null > "$tmp" || true ;;
+      modified)
+        diff -uN "orig/$rel" "dist/$rel" > "$tmp"; status=$? ;;
+      added)
+        diff -uN /dev/null "dist/$rel" > "$tmp"; status=$? ;;
+      deleted)
+        diff -uN "orig/$rel" /dev/null > "$tmp"; status=$? ;;
     esac
     popd >/dev/null
+
+    # Accept exit status 0 (no diff) or 1 (diffs found).  Anything else is
+    # a real error (e.g. I/O problem) and should abort.
+    if (( status > 1 )); then
+      echo "patches: diff failed for $rel (status $status)" >&2
+      exit $status
+    fi
 
     # Preserve leading comment block if present.
     header=""
