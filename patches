@@ -110,18 +110,44 @@ if [[ $mode == "make" ]]; then
     fi
 
     mkdir -p "$(dirname "$pp")"
+
+    # Create a per-iteration temporary file for diff output. Set up a trap so
+    # that if the script is interrupted (e.g. via SIGINT) the temporary file
+    # is deleted instead of being left behind.
     tmp=$(mktemp "$patch_dir/.tmpXXXXXX")
+
+    cleanup_tmp() {
+      [[ -n ${tmp-} && -f $tmp ]] && rm -f "$tmp"
+    }
+
+    # Remove the temporary file on normal shell EXIT, and also if the user
+    # aborts with Ctrl-C (SIGINT) or the process receives SIGTERM.
+    trap 'cleanup_tmp; exit 1' INT TERM
+    trap 'cleanup_tmp' EXIT
 
     # Run diff from within $workdir so generated paths are relative (e.g.
     # orig/foo.txt) instead of absolute.  This ensures patch -p1 works.
     pushd "$workdir" >/dev/null
     case $state in
       modified)
-        diff -uN "orig/$rel" "dist/$rel" > "$tmp"; status=$? ;;
+        # Temporarily disable `set -e` so that the non-zero exit status (1)
+        # that diff returns when differences are found does not abort the
+        # script. We capture the exit code in $status and re-enable the
+        # option immediately afterwards.
+        set +e
+        diff -uN "orig/$rel" "dist/$rel" > "$tmp"
+        status=$?
+        set -e ;;
       added)
-        diff -uN /dev/null "dist/$rel" > "$tmp"; status=$? ;;
+        set +e
+        diff -uN /dev/null "dist/$rel" > "$tmp"
+        status=$?
+        set -e ;;
       deleted)
-        diff -uN "orig/$rel" /dev/null > "$tmp"; status=$? ;;
+        set +e
+        diff -uN "orig/$rel" /dev/null > "$tmp"
+        status=$?
+        set -e ;;
     esac
     popd >/dev/null
 
@@ -147,6 +173,10 @@ if [[ $mode == "make" ]]; then
     } > "$pp"
 
     rm "$tmp"
+    # Clear the cleanup trap now that the temporary file is gone to avoid
+    # redundant checks later and so that subsequent iterations can install
+    # their own handler.
+    trap - INT TERM EXIT
     kept["$pp"]=1
   done
 
